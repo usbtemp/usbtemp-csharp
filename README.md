@@ -35,9 +35,22 @@ Use `Measure()` and `Acquire()` instead of `Temperature()` to do other work duri
 | 12 bits | 0.0625 °C | 750 ms |
 
 Errors:
-* `ThermometerException` – the probe does not respond, CRC mismatch or unexpected device.
-* `ArgumentOutOfRangeException` – `SetPrecision()` called with a value outside 9..12.
-* Exceptions of `System.IO.Ports.SerialPort` (`IOException`, `UnauthorizedAccessException`, `TimeoutException`) – the serial port does not exist, is in use or cannot be accessed.
+
+Probe and bus errors throw `ThermometerException`, with the same messages as the Node.js and Python libraries:
+
+| Message | Cause |
+|---|---|
+| `Device is not connected` | `Open()` was not called or the port is closed |
+| `Read timeout` | the adapter does not answer within 500 ms |
+| `No device present` | no probe is connected |
+| `Short circuit` | the 1-wire bus is shorted |
+| `Presence error: 0x..` | unexpected response to the bus reset |
+| `Invalid response` | a byte sent to the probe was not echoed back correctly |
+| `CRC error` | the data read from the probe is corrupted |
+| `Invalid device` | the probe is not a DS18B20 |
+
+`SetPrecision()` throws `ArgumentOutOfRangeException` for a value outside 9..12.
+`Open()` and writes throw the exceptions of `System.IO.Ports.SerialPort` (`IOException`, `UnauthorizedAccessException`, `TimeoutException`) when the serial port does not exist, is in use or cannot be accessed.
 
 Example:
 ```csharp

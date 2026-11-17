@@ -12,9 +12,6 @@ namespace usbtemp
 
     public class Thermometer
     {
-        const int ok = 0;
-        const int fail = -1;
-
         const byte generator = 0x8c;
         const int rom_size = 8;
         const int sp_size = 9;
@@ -40,6 +37,9 @@ namespace usbtemp
         const int data_baud = 115200;
         const int data_data_bits = 6;
 
+        // Milliseconds to wait for the adapter.
+        const int io_timeout = 500;
+
         public const int MinPrecision = 9;
         public const int MaxPrecision = 12;
 
@@ -63,6 +63,13 @@ namespace usbtemp
             return crc;
         }
 
+        // Drop stale bytes, e.g. a late reply after a timeout, so they are not read as the next answer.
+        void Clear()
+        {
+            mySerialPort.DiscardInBuffer();
+            mySerialPort.DiscardOutBuffer();
+        }
+
         void SetSpeed(int baud, int dataBits)
         {
             mySerialPort.BaudRate = baud;
@@ -79,37 +86,39 @@ namespace usbtemp
             return ((config >> 5) & 0x03) + MinPrecision;
         }
 
-        protected int OwReset()
+        // Read exactly count bytes, as Read() may return fewer.
+        void ReadExactly(byte[] buf, int count)
         {
-            int rv;
-            byte wbuff;
+            int offset = 0;
+
+            try
+            {
+                while (offset < count)
+                {
+                    offset += mySerialPort.Read(buf, offset, count - offset);
+                }
+            }
+            catch (TimeoutException)
+            {
+                throw new ThermometerException("Read timeout");
+            }
+        }
+
+        protected void OwReset()
+        {
             byte rbuff;
             byte[] buf;
 
+            Clear();
             SetSpeed(reset_baud, reset_data_bits);
 
             buf = new byte[1];
 
             try
             {
-                wbuff = 0xf0;
-                buf[0] = wbuff;
+                buf[0] = 0xf0;
                 mySerialPort.Write(buf, 0, 1);
-
-                // No echo means nothing answered the reset pulse.
-                if (mySerialPort.Read(buf, 0, 1) != 1)
-                {
-                    rv = fail;
-                }
-                else
-                {
-                    rbuff = buf[0];
-                    rv = (rbuff == 0x00 || rbuff == 0xf0) ? fail : ok;
-                }
-            }
-            catch (TimeoutException)
-            {
-                rv = fail;
+                ReadExactly(buf, 1);
             }
             finally
             {
@@ -117,12 +126,25 @@ namespace usbtemp
                 SetSpeed(data_baud, data_data_bits);
             }
 
-            return rv;
+            // The probe's presence pulse pulls part of the echoed 0xf0 low.
+            rbuff = buf[0];
+            if (rbuff == 0xf0)
+            {
+                throw new ThermometerException("No device present");
+            }
+            if (rbuff == 0x00)
+            {
+                throw new ThermometerException("Short circuit");
+            }
+            if (rbuff < 0x10 || rbuff > 0xe0)
+            {
+                throw new ThermometerException($"Presence error: 0x{rbuff:x2}");
+            }
         }
 
         protected byte OwWriteByte(byte wbuff)
         {
-            int rbytes, remaining, i;
+            int i;
             byte[] buf;
             byte rbuff;
 
@@ -131,19 +153,16 @@ namespace usbtemp
             {
                 buf[i] = Convert.ToBoolean(wbuff & (1 << (i & 0x7))) ? (byte)0xff : (byte)0x00;
             }
+            Clear();
             mySerialPort.Write(buf, 0, 8);
 
+            ReadExactly(buf, 8);
+
             rbuff = 0;
-            remaining = 8;
-            while (remaining > 0)
+            for (i = 0; i < 8; i++)
             {
-                rbytes = mySerialPort.Read(buf, 0, remaining);
-                for (i = 0; i < rbytes; i++)
-                {
-                    rbuff >>= 1;
-                    rbuff |= (buf[i] & 0x01) == 0x01 ? (byte)0x80 : (byte)0x00;
-                    remaining--;
-                }
+                rbuff >>= 1;
+                rbuff |= (buf[i] & 0x01) == 0x01 ? (byte)0x80 : (byte)0x00;
             }
             return rbuff;
         }
@@ -153,28 +172,25 @@ namespace usbtemp
             return OwWriteByte(0xff);
         }
 
-        protected int OwWrite(byte wbuff)
+        protected void OwWrite(byte wbuff)
         {
             if (OwWriteByte(wbuff) != wbuff)
             {
-                return fail;
+                throw new ThermometerException("Invalid response");
             }
-            return ok;
         }
 
-        // Reset the bus and send the command bytes; throw with the given message if any step fails.
-        protected void Command(string error, params byte[] bytes)
+        // Reset the bus and send the command bytes.
+        protected void Command(params byte[] bytes)
         {
-            if (OwReset() == fail)
+            if (mySerialPort == null || !mySerialPort.IsOpen)
             {
-                throw new ThermometerException(error);
+                throw new ThermometerException("Device is not connected");
             }
+            OwReset();
             foreach (byte b in bytes)
             {
-                if (OwWrite(b) == fail)
-                {
-                    throw new ThermometerException(error);
-                }
+                OwWrite(b);
             }
         }
 
@@ -195,7 +211,7 @@ namespace usbtemp
         {
             if (buf[buf.Length - 1] != LsbCrc8(buf, buf.Length - 1, generator))
             {
-                throw new ThermometerException("CRC Error!");
+                throw new ThermometerException("CRC error");
             }
         }
 
@@ -210,8 +226,8 @@ namespace usbtemp
                 Handshake = Handshake.None,
                 RtsEnable = false,
 
-                ReadTimeout = 500,
-                WriteTimeout = 500
+                ReadTimeout = io_timeout,
+                WriteTimeout = io_timeout
             };
 
             mySerialPort.Open();
@@ -231,7 +247,7 @@ namespace usbtemp
         {
             byte[] rom;
 
-            Command("Cannot read ROM!", cmd_read_rom);
+            Command(cmd_read_rom);
 
             rom = ReadBytes(rom_size);
             CheckCrc(rom);
@@ -241,7 +257,7 @@ namespace usbtemp
 
         public void Measure()
         {
-            Command("Cannot start the conversion process!", cmd_skip_rom, cmd_convert_t);
+            Command(cmd_skip_rom, cmd_convert_t);
         }
 
         public float Acquire()
@@ -249,7 +265,7 @@ namespace usbtemp
             byte[] sp_sensor;
             short T;
 
-            sp_sensor = ReadScratchpad("Cannot read the temperature!");
+            sp_sensor = ReadScratchpad();
 
             T = BitConverter.ToInt16(sp_sensor, 0);
             return (float)T / 16;
@@ -270,47 +286,48 @@ namespace usbtemp
             if (precision < MinPrecision || precision > MaxPrecision)
             {
                 throw new ArgumentOutOfRangeException(nameof(precision), precision,
-                    $"Precision must be between {MinPrecision} and {MaxPrecision} bits.");
+                    $"Precision must be between {MinPrecision} and {MaxPrecision} bits");
             }
 
             cfg_new = PrecisionToConfig(precision);
 
-            sp_sensor = ReadScratchpad("Cannot read the configuration!");
+            sp_sensor = ReadScratchpad();
             if (sp_sensor[sp_config] == cfg_new)
             {
                 return;
             }
 
             // Write Scratchpad: TH, TL and config (TH/TL kept as they are).
-            Command("Cannot write the configuration!", cmd_skip_rom, cmd_write_scratchpad,
+            Command(cmd_skip_rom, cmd_write_scratchpad,
                 sp_sensor[sp_th], sp_sensor[sp_tl], cfg_new);
 
             // Copy Scratchpad to EEPROM so the setting survives power loss.
-            Command("Cannot save the configuration!", cmd_skip_rom, cmd_copy_scratchpad);
+            Command(cmd_skip_rom, cmd_copy_scratchpad);
         }
 
         public int GetPrecision()
         {
             byte[] sp_sensor;
 
-            sp_sensor = ReadScratchpad("Cannot read the configuration!");
+            sp_sensor = ReadScratchpad();
 
             return ConfigToPrecision(sp_sensor[sp_config]);
         }
 
-        protected byte[] ReadScratchpad(string error)
+        // Read the scratchpad and check that it comes from a DS18B20.
+        protected byte[] ReadScratchpad()
         {
             byte[] sp_sensor;
 
-            Command(error, cmd_skip_rom, cmd_read_scratchpad);
+            Command(cmd_skip_rom, cmd_read_scratchpad);
 
             sp_sensor = ReadBytes(sp_size);
+            CheckCrc(sp_sensor);
 
             if ((sp_sensor[sp_config] & config_mask) != config_fixed)
             {
-                throw new ThermometerException("Invalid device!");
+                throw new ThermometerException("Invalid device");
             }
-            CheckCrc(sp_sensor);
 
             return sp_sensor;
         }
